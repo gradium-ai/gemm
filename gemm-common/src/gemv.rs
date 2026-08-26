@@ -638,8 +638,14 @@ fn range_start(tid: usize, n_tasks: usize, n_items: usize, granularity: usize) -
     Ord::min(granule * granularity, n_items)
 }
 
-/// splits `m` (the output length), falling back to a split along `k` with a reduction pass
-/// when `m` is too short to keep every thread busy.
+/// splits the work across `parallelism` and runs `serial` on each piece.
+///
+/// carves the problem into a grid of `n_row_tasks` row chunks by `n_depth_tasks` depth slices,
+/// chosen by `split_tasks` from `axis`. a row-only split (`n_depth_tasks == 1`) needs no
+/// scratch and is bit-identical to `serial`, since each task owns disjoint `dst` rows and runs
+/// the full `k` loop over them. once `k` is split, each slice instead accumulates a partial
+/// into its own scratch column and a second pass reduces them, which reassociates the sum
+/// over `k`.
 ///
 /// `serial` must be one of `mixed_gemv_colmajor` / `mixed_gemv_rowmajor`, and the layout
 /// preconditions it asserts must already hold. both variants offset identically: a task
