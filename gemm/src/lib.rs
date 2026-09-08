@@ -6,6 +6,7 @@ mod gemm;
 #[cfg(feature = "f16")]
 pub use crate::gemm::f16;
 pub use crate::gemm::{c32, c64, gemm};
+pub use gemm_common::packed_cache;
 pub use gemm_common::Parallelism;
 
 pub use gemm_common::gemm::{
@@ -23,6 +24,59 @@ mod tests {
     extern crate alloc;
     use alloc::{vec, vec::Vec};
     use num_traits::Float;
+
+    /// A cached lhs panel must give the same answer as packing per call. One test, since
+    /// enabling the cache is a process-wide switch.
+    #[test]
+    fn test_packed_lhs_cache_hit_matches_miss() {
+        // Row-major cases cover the widened path: uncached, a row-contiguous lhs is read in
+        // place rather than packed. 1536 rows is past 2 * mc, never prepacked before.
+        let cases = [
+            (64, 16, 128, false),
+            (96, 33, 100, false),
+            (512, 16, 384, true),
+            (1536, 16, 512, true),
+            (512, 128, 300, true),
+        ];
+        packed_cache::set_enabled(true);
+        packed_cache::set_budget_mb(1024);
+        packed_cache::clear();
+
+        for (m, n, k, row_major) in cases {
+            let (lhs_rs, lhs_cs) = if row_major { (k as isize, 1) } else { (1, m as isize) };
+            let a: Vec<f32> = (0..m * k).map(|_| rand::random()).collect();
+            let b: Vec<f32> = (0..k * n).map(|_| rand::random()).collect();
+            let mut want = vec![0f32; m * n];
+            let mut got = vec![0f32; m * n];
+            // SAFETY: shapes and strides match the buffers, which are sized to suit.
+            unsafe {
+                gemm::gemm_fallback(
+                    m, n, k, want.as_mut_ptr(), m as isize, 1, false, a.as_ptr(), lhs_cs,
+                    lhs_rs, b.as_ptr(), k as isize, 1, 0.0, 1.0,
+                );
+                // Three rounds: the probe, the call that packs, then the calls that hit.
+                for _ in 0..3 {
+                    for parallelism in [
+                        Parallelism::None,
+                        #[cfg(feature = "rayon")]
+                        Parallelism::Rayon(0),
+                    ] {
+                        gemm::gemm(
+                            m, n, k, got.as_mut_ptr(), m as isize, 1, false, a.as_ptr(),
+                            lhs_cs, lhs_rs, b.as_ptr(), k as isize, 1, 0.0, 1.0, false,
+                            false, false, parallelism,
+                        );
+                        for (c, d) in got.iter().zip(want.iter()) {
+                            assert_approx_eq::assert_approx_eq!(c, d, 1e-3);
+                        }
+                    }
+                }
+            }
+            assert!(packed_cache::stats().1 > 0, "the cached path was never taken");
+        }
+        packed_cache::clear();
+        packed_cache::set_enabled(false);
+    }
 
     #[test]
     fn test_gemm_f16() {

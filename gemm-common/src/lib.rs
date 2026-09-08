@@ -31,6 +31,7 @@ pub mod horizontal_microkernel;
 pub mod microkernel;
 
 pub mod pack_operands;
+pub mod packed_cache;
 pub mod simd;
 
 pub use pulp;
