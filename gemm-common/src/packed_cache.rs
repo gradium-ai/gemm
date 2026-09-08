@@ -348,16 +348,23 @@ mod tests {
     use super::*;
 
     const M: usize = 64;
-    const K: usize = 64;
     const BYTES: usize = 64 * 8 * (M / 8) * 4;
 
     fn operand(seed: usize) -> Vec<f32> {
-        (0..M * K).map(|i| (i as f32) * 0.5 + seed as f32).collect()
+        (0..M * M).map(|i| (i as f32) * 0.5 + seed as f32).collect()
     }
 
     fn getp(v: &[f32]) -> Option<Panel> {
-        // SAFETY: `v` is an M-by-K f32 matrix with these strides, and no test mutates one.
-        unsafe { get::<f32>(v.as_ptr(), M, K, 1, M as isize, 64, 8, BYTES, 64) }
+        // SAFETY: `v` is an M-by-M f32 matrix with these strides, and no test mutates one.
+        unsafe { get::<f32>(v.as_ptr(), M, M, 1, M as isize, 64, 8, BYTES, 64) }
+    }
+
+    /// Second sighting, then mark, then hit.
+    fn cycle(v: &[f32]) -> Panel {
+        assert!(getp(v).is_none(), "first sighting is a probe, not a panel");
+        let panel = getp(v).expect("second sighting hands back a panel");
+        assert!(!panel.filled, "a fresh panel holds nothing yet");
+        panel
     }
 
     fn fresh() {
@@ -370,57 +377,37 @@ mod tests {
     /// need `--test-threads=1` to stay honest.
     #[test]
     fn cache_mechanics() {
-        // Off by default, on a repeat sighting as much as a first.
         set_enabled(false);
         let a = operand(1);
         assert!(getp(&a).is_none());
-        assert!(getp(&a).is_none());
+        assert!(getp(&a).is_none(), "off by default, on a repeat as much as a first");
 
-        // Storage arrives on the second sighting, so an operand seen once costs nothing.
         fresh();
-        let a = operand(2);
-        assert!(getp(&a).is_none(), "first sighting is a probe, not a panel");
-        let panel = getp(&a).expect("second sighting hands back a panel");
-        assert!(!panel.filled, "a fresh panel holds nothing yet");
-        panel.mark_filled();
-        drop(panel);
-        assert!(
-            getp(&a).expect("still cached").filled,
-            "a later call can skip packing"
-        );
+        cycle(&a).mark_filled();
+        assert!(getp(&a).expect("cached").filled, "a later call can skip packing");
 
         // The flag a `Panel` marks must not live in the entry vector. A handle spans a whole
         // gemm call, and a nested gemm on the same thread -- rayon lets the caller steal one
         // -- pushes entries, reallocating that vector, and evicts probes, shifting it.
         fresh();
-        let a = operand(3);
-        assert!(getp(&a).is_none());
-        let panel = getp(&a).expect("panel");
-        let others: Vec<Vec<f32>> = (0..200).map(|s| operand(100 + s)).collect();
+        let panel = cycle(&a);
+        let others: Vec<Vec<f32>> = (0..200).map(operand).collect();
         for o in &others {
             let _ = getp(o);
         }
         panel.mark_filled();
         drop(panel);
-        assert!(
-            getp(&a).expect("still cached").filled,
-            "mark_filled() reached the right entry"
-        );
+        assert!(getp(&a).expect("cached").filled, "mark_filled() found the right entry");
 
-        // `clear` gives the bytes back and forgets the operand.
         fresh();
-        let a = operand(4);
-        assert!(getp(&a).is_none());
-        let _ = getp(&a).expect("panel");
+        drop(cycle(&a));
         assert_eq!(stats(), (BYTES, 1));
         clear();
-        assert_eq!(stats(), (0, 0));
+        assert_eq!(stats(), (0, 0), "clear returns the bytes");
         assert!(getp(&a).is_none(), "a cleared operand is a stranger again");
 
-        // A spent budget declines rather than overshooting it.
         fresh();
         set_budget_mb(0);
-        let a = operand(5);
         assert!(getp(&a).is_none());
         assert!(getp(&a).is_none(), "no panel once the budget is spent");
         assert_eq!(stats().0, 0, "a refusal claims nothing");

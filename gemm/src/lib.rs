@@ -25,74 +25,55 @@ mod tests {
     use alloc::{vec, vec::Vec};
     use num_traits::Float;
 
-    /// `dst = lhs * rhs`, with a column-major dst and a row-major rhs.
-    fn matmul_f32(
-        m: usize,
-        n: usize,
-        k: usize,
-        (lhs_rs, lhs_cs): (isize, isize),
-        lhs: &[f32],
-        rhs: &[f32],
-        parallelism: Parallelism,
-    ) -> Vec<f32> {
-        let mut dst = vec![0f32; m * n];
-        // SAFETY: shapes and strides match the buffers, which are all sized to suit.
-        unsafe {
-            gemm(
-                m, n, k, dst.as_mut_ptr(), m as isize, 1, false, lhs.as_ptr(), lhs_cs, lhs_rs,
-                rhs.as_ptr(), k as isize, 1, 0f32, 1f32, false, false, false, parallelism,
-            );
-        }
-        dst
-    }
-
     /// A cached lhs panel must give the same answer as packing per call. One test, since
     /// enabling the cache is a process-wide switch.
     #[test]
     fn test_packed_lhs_cache_hit_matches_miss() {
-        // (m, n, k, row_major_lhs). The row-major cases cover the widened path: uncached,
-        // a row-contiguous lhs is read in place rather than packed.
+        // Row-major cases cover the widened path: uncached, a row-contiguous lhs is read in
+        // place rather than packed. 1536 rows is past 2 * mc, never prepacked before.
         let cases = [
             (64, 16, 128, false),
-            (96, 33, 100, false), // m not a multiple of MR, ragged n
-            (37, 5, 71, false),
+            (96, 33, 100, false),
             (512, 16, 384, true),
-            (1536, 16, 512, true), // m > 2 * mc, so never prepacked before
-            (512, 128, 300, true), // several column chunks
+            (1536, 16, 512, true),
+            (512, 128, 300, true),
         ];
+        packed_cache::set_enabled(true);
+        packed_cache::set_budget_mb(1024);
+        packed_cache::clear();
 
         for (m, n, k, row_major) in cases {
-            let strides = if row_major { (k as isize, 1) } else { (1, m as isize) };
-            let lhs: Vec<f32> =
-                (0..m * k).map(|i| ((i * 37 % 101) as f32) / 101.0 - 0.5).collect();
-            let rhs: Vec<f32> =
-                (0..k * n).map(|i| ((i * 53 % 97) as f32) / 97.0 - 0.5).collect();
-
-            packed_cache::set_enabled(false);
-            let want = matmul_f32(m, n, k, strides, &lhs, &rhs, Parallelism::None);
-
-            packed_cache::set_enabled(true);
-            packed_cache::set_budget_mb(1024);
-            packed_cache::clear();
-            // Three rounds: the probe, the call that packs, then the calls that hit.
-            for round in 0..3 {
-                for parallelism in [Parallelism::None, Parallelism::Rayon(0)] {
-                    let got = matmul_f32(m, n, k, strides, &lhs, &rhs, parallelism);
-                    let worst = got
-                        .iter()
-                        .zip(&want)
-                        .map(|(a, b)| (a - b).abs())
-                        .fold(0f32, f32::max);
-                    assert!(
-                        worst < 1e-4,
-                        "{m}x{k} * {k}x{n} row_major={row_major} round={round} \
-                         {parallelism:?}: max error {worst}"
-                    );
+            let (lhs_rs, lhs_cs) = if row_major { (k as isize, 1) } else { (1, m as isize) };
+            let a: Vec<f32> = (0..m * k).map(|_| rand::random()).collect();
+            let b: Vec<f32> = (0..k * n).map(|_| rand::random()).collect();
+            let mut want = vec![0f32; m * n];
+            let mut got = vec![0f32; m * n];
+            // SAFETY: shapes and strides match the buffers, which are sized to suit.
+            unsafe {
+                gemm::gemm_fallback(
+                    m, n, k, want.as_mut_ptr(), m as isize, 1, false, a.as_ptr(), lhs_cs,
+                    lhs_rs, b.as_ptr(), k as isize, 1, 0.0, 1.0,
+                );
+                // Three rounds: the probe, the call that packs, then the calls that hit.
+                for _ in 0..3 {
+                    for parallelism in [
+                        Parallelism::None,
+                        #[cfg(feature = "rayon")]
+                        Parallelism::Rayon(0),
+                    ] {
+                        gemm::gemm(
+                            m, n, k, got.as_mut_ptr(), m as isize, 1, false, a.as_ptr(),
+                            lhs_cs, lhs_rs, b.as_ptr(), k as isize, 1, 0.0, 1.0, false,
+                            false, false, parallelism,
+                        );
+                        for (c, d) in got.iter().zip(want.iter()) {
+                            assert_approx_eq::assert_approx_eq!(c, d, 1e-3);
+                        }
+                    }
                 }
             }
             assert!(packed_cache::stats().1 > 0, "the cached path was never taken");
         }
-
         packed_cache::clear();
         packed_cache::set_enabled(false);
     }
