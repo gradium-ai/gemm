@@ -415,9 +415,47 @@ pub unsafe fn gemm_basic_generic<
     #[cfg(not(target_arch = "aarch64"))]
     let do_pack_rhs = (rhs_rs.unsigned_abs() != 1 && m > 2 * MR)
         || (rhs_rs.unsigned_abs() == 1 && m > get_rhs_packing_threshold() * MR);
-    let do_prepack_lhs = m <= 2 * mc && ((m % N != 0) || lhs_rs != 1);
+    // Packing the whole lhs up front is normally reserved for a small lhs, because the panel
+    // is scratch and a large one wastes cache. A cached panel is not scratch: it is committed
+    // for the life of the process and its total size is the same either way, so the size
+    // guard only applies when we are packing per call.
+    // A row-contiguous lhs is normally left unpacked, because the microkernel can read it in
+    // place. That is the right call per call, but it then strides by `lhs_cs` down the
+    // reduction loop, and on a transposed weight -- what `conv_transpose1d` produces -- that
+    // measured several times slower than packing. So consult the cache for those too, and
+    // pack when it hands back a panel.
+    //
+    // Safe to widen only because the cache withholds storage until an operand's second
+    // sighting: an activation never gets a panel, so this never drags one onto the
+    // pack-per-call path that the `m <= 2 * mc` guard exists to avoid.
+    let lhs_is_packable = (m % N != 0) || lhs_rs != 1;
 
-    let mut mem = if do_pack_rhs || do_prepack_lhs {
+    // A weight reused across calls only needs packing once. The cache is keyed on the operand
+    // and declines unless explicitly enabled, so by default this is exactly the old path.
+    let n_lhs_panels = m.msrv_next_multiple_of(MR) / MR;
+    let n_k_chunks = k.msrv_div_ceil(kc);
+    let lhs_panel_bytes = packed_lhs_stride
+        .saturating_mul(n_lhs_panels)
+        .saturating_mul(n_k_chunks)
+        .saturating_mul(core::mem::size_of::<T>());
+    let cached_lhs = if crate::packed_cache::enabled() {
+        // SAFETY: `lhs` is valid for an m-by-k read with these strides, as the caller of
+        // `gemm` promises. Whether its contents are stable is the cache's documented
+        // precondition, which is why it is opt-in.
+        unsafe {
+            crate::packed_cache::get::<T>(
+                lhs.0, m, k, lhs_rs, lhs_cs, kc, MR, lhs_panel_bytes, simd_align,
+            )
+        }
+    } else {
+        None
+    };
+    let do_prepack_lhs =
+        (lhs_is_packable && m <= 2 * mc) || cached_lhs.is_some();
+    // Scratch is only needed for the chunk-at-a-time path.
+    let alloc_prepacked = do_prepack_lhs && cached_lhs.is_none();
+
+    let mut mem = if do_pack_rhs || alloc_prepacked {
         let rhs_req = StackReq::new_aligned::<T>(
             if do_pack_rhs {
                 packed_rhs_stride * (nc / NR)
@@ -427,7 +465,7 @@ pub unsafe fn gemm_basic_generic<
             simd_align,
         );
         let lhs_req = StackReq::new_aligned::<T>(
-            if do_prepack_lhs {
+            if alloc_prepacked {
                 packed_lhs_stride * (m.msrv_next_multiple_of(MR) / MR)
             } else {
                 0
@@ -460,7 +498,7 @@ pub unsafe fn gemm_basic_generic<
             rhs,
             stack
                 .make_aligned_uninit::<T>(
-                    if do_prepack_lhs {
+                    if alloc_prepacked {
                         packed_lhs_stride * (m.msrv_next_multiple_of(MR) / MR)
                     } else {
                         0
@@ -622,12 +660,19 @@ pub unsafe fn gemm_basic_generic<
                     }
                 }
             }
-            if do_prepack_lhs {
+            // With a cached panel every chunk has its own slot, so the whole lhs stays packed
+            // between calls; without one there is a single slot reused chunk by chunk.
+            let chunk_prepacked_lhs = match &cached_lhs {
+                Some(c) => Ptr((c.ptr as *mut T)
+                    .wrapping_add((depth_outer / kc) * packed_lhs_stride * n_lhs_panels)),
+                None => prepacked_lhs,
+            };
+            if do_prepack_lhs && !cached_lhs.as_ref().is_some_and(|c| c.filled) {
                 pack_lhs::<T, N, MR, _>(
                     simd,
                     m,
                     k_chunk,
-                    prepacked_lhs,
+                    chunk_prepacked_lhs,
                     lhs.wrapping_offset(depth_outer as isize * lhs_cs),
                     lhs_cs,
                     lhs_rs,
@@ -793,13 +838,13 @@ pub unsafe fn gemm_basic_generic<
 
             if do_prepack_lhs {
                 match parallelism {
-                    Parallelism::None => func(0, prepacked_lhs),
+                    Parallelism::None => func(0, chunk_prepacked_lhs),
                     #[cfg(feature = "rayon")]
                     Parallelism::Rayon(_) => {
                         if n_threads == 1 {
-                            func(0, prepacked_lhs);
+                            func(0, chunk_prepacked_lhs);
                         } else {
-                            par_for_each(n_threads, |tid| func(tid, prepacked_lhs));
+                            par_for_each(n_threads, |tid| func(tid, chunk_prepacked_lhs));
                         }
                     }
                 }
@@ -844,6 +889,11 @@ pub unsafe fn gemm_basic_generic<
             depth_outer += k_chunk;
         }
         col_outer += n_chunk;
+    }
+
+    // Every k-chunk has been written now, so later calls on this operand can skip packing.
+    if let Some(c) = &cached_lhs {
+        c.mark_filled();
     }
 }
 
