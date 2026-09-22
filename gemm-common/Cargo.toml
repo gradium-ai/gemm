@@ -1,6 +1,6 @@
 [package]
 name = "xn-gemm-common"
-version = "0.20.0"
+version = "0.20.1"
 edition = "2021"
 authors = ["sarah <>"]
 description = "Fork of the gemm matrix multiplication crates, with a parallel gemv and kc/L1 cache blocking, published for the xn inference framework."
