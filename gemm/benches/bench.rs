@@ -1,6 +1,6 @@
 use aligned_vec::{avec, AVec};
 use diol::prelude::*;
-use gemm::*;
+use xn_gemm::*;
 use num_traits::One;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -113,7 +113,7 @@ fn args() -> Vec<List![Parallelism, Layout, Layout, Layout, usize, usize, usize]
 fn main() -> std::io::Result<()> {
     let config = BenchConfig::from_args()?;
 
-    gemm::set_wasm_simd128(true);
+    xn_gemm::set_wasm_simd128(true);
 
     let modifiers = [1];
 
@@ -121,7 +121,7 @@ fn main() -> std::io::Result<()> {
         let mut bench = Bench::new(&config);
         bench.register(bench_gemm::<f16>, args());
         for modifier in modifiers {
-            gemm::set_threading_threshold(gemm::DEFAULT_THREADING_THRESHOLD / modifier);
+            xn_gemm::set_threading_threshold(xn_gemm::DEFAULT_THREADING_THRESHOLD / modifier);
             bench.run().unwrap();
         }
     }
@@ -131,7 +131,7 @@ fn main() -> std::io::Result<()> {
         bench.register(bench_gemm::<f32>, args());
 
         for modifier in modifiers {
-            gemm::set_threading_threshold(gemm::DEFAULT_THREADING_THRESHOLD / modifier);
+            xn_gemm::set_threading_threshold(xn_gemm::DEFAULT_THREADING_THRESHOLD / modifier);
             bench.run().unwrap();
         }
     }
@@ -139,7 +139,7 @@ fn main() -> std::io::Result<()> {
         let mut bench = Bench::new(&config);
         bench.register(bench_gemm::<f64>, args());
         for modifier in modifiers {
-            gemm::set_threading_threshold(gemm::DEFAULT_THREADING_THRESHOLD / modifier);
+            xn_gemm::set_threading_threshold(xn_gemm::DEFAULT_THREADING_THRESHOLD / modifier);
             bench.run().unwrap();
         }
     }
@@ -147,7 +147,7 @@ fn main() -> std::io::Result<()> {
         let mut bench = Bench::new(&config);
         bench.register(bench_gemm::<c32>, args());
         for modifier in modifiers {
-            gemm::set_threading_threshold(gemm::DEFAULT_THREADING_THRESHOLD / modifier);
+            xn_gemm::set_threading_threshold(xn_gemm::DEFAULT_THREADING_THRESHOLD / modifier);
             bench.run().unwrap();
         }
     }
@@ -155,7 +155,7 @@ fn main() -> std::io::Result<()> {
         let mut bench = Bench::new(&config);
         bench.register(bench_gemm::<c64>, args());
         for modifier in modifiers {
-            gemm::set_threading_threshold(gemm::DEFAULT_THREADING_THRESHOLD / modifier);
+            xn_gemm::set_threading_threshold(xn_gemm::DEFAULT_THREADING_THRESHOLD / modifier);
             bench.run().unwrap();
         }
     }

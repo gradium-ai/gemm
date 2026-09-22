@@ -1,11 +1,11 @@
 [package]
-name = "gemm-f16"
-version = "0.20.0"
+name = "xn-gemm-f16"
+version = "0.20.1"
 edition = "2021"
 authors = ["sarah <>"]
-description = "Playground for matrix multiplication algorithms"
+description = "Fork of the gemm matrix multiplication crates, with a parallel gemv and kc/L1 cache blocking, published for the xn inference framework."
 readme = "../README.md"
-repository = "https://github.com/sarah-ek/gemm/"
+repository = "https://github.com/gradium-ai/gemm/"
 license = "MIT"
 keywords = ["linear-algebra"]
 
@@ -18,8 +18,8 @@ num-complex = { workspace = true, default-features = false }
 paste = { workspace = true }
 rayon = { workspace =true, optional = true }
 
-gemm-common = { version = "0.20.0", default-features = false, path = "../gemm-common", features = ["f16"] }
-gemm-f32 = { version = "0.20.0", default-features = false, path = "../gemm-f32" }
+gemm-common = { package = "xn-gemm-common", version = "0.20.1", default-features = false, path = "../gemm-common", features = ["f16"] }
+gemm-f32 = { package = "xn-gemm-f32", version = "0.20.1", default-features = false, path = "../gemm-f32" }
 half = { workspace = true, default-features = false }
 
 [features]
