@@ -516,7 +516,14 @@ pub mod simd128 {
 
         #[inline(always)]
         pub unsafe fn mul_add(a: Pack, b: Pack, c: Pack) -> Pack {
-            add(c, mul(a, b))
+            #[cfg(target_feature = "relaxed-simd")]
+            {
+                transmute(f32x4_relaxed_madd(transmute(a), transmute(b), transmute(c)))
+            }
+            #[cfg(not(target_feature = "relaxed-simd"))]
+            {
+                add(c, mul(a, b))
+            }
         }
 
         #[inline(always)]
