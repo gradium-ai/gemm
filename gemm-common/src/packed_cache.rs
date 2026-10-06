@@ -4,21 +4,32 @@
 //! wrong for a weight, and it costs most when the output has few columns, since packing
 //! costs the same however many columns it is then used for.
 //!
-//! It assumes the bytes behind an lhs pointer never change -- true for inference, false for
-//! a caller that mutates in place -- so it is off unless `GEMM_PACKED_LHS_CACHE=1` or
-//! [`set_enabled`]. Two things guard a hit: the key carries a fingerprint sampled from the
-//! contents, so a recycled address misses instead of returning a stale panel, and it carries
-//! every parameter the layout depends on, notably `kc`.
+//! It assumes the bytes behind a cached lhs never change. That holds for a weight and not for
+//! an operand written in place between calls, such as a fixed-size key/value cache, so there
+//! are two ways in:
 //!
-//! Nothing in a call says whether its lhs is a weight or an activation, and caching an
-//! activation buys a panel used once -- worse, it can widen the caller's packing decision
-//! onto a slower path. So storage is withheld until an operand's *second* sighting: the first
-//! records a probe, which for a weight pays off on the next call and for an activation never
-//! does, since its fingerprint moves.
+//! - [`with_constant`]: the caller names the bytes it vouches for, and only an lhs lying wholly
+//!   inside them is cached. It needs no switch, and it is the one to use from a library,
+//!   which cannot vouch for every operand its users pass.
+//! - `GEMM_PACKED_LHS_CACHE=1` or [`set_enabled`]: every lhs is trusted, for a program that
+//!   knows it never writes an operand in place.
+//!
+//! Two things guard a hit: the key carries a fingerprint sampled from the contents, so a
+//! recycled address misses instead of returning a stale panel, and it carries every parameter
+//! the layout depends on, notably `kc`. The fingerprint is eight elements, so it does not
+//! catch a write in place that misses them; that is what the two switches are for.
+//!
+//! Under [`set_enabled`] nothing in a call says whether its lhs is a weight or an activation,
+//! and caching an activation buys a panel used once. Worse, it can widen the caller's packing
+//! decision onto a slower path. So storage is withheld until an operand's *second* sighting:
+//! the first records a probe, which for a weight pays off on the next call and for an
+//! activation never does, since its fingerprint moves. The same rule keeps a declared
+//! constant that is used only once from holding a panel.
 //!
 //! Entries are never evicted; [`clear`] releases a thread's copies, and
 //! `GEMM_PACKED_LHS_CACHE_MB` or [`set_budget_mb`] caps the total held process-wide. Past the
-//! cap, or past [`MAX_ENTRIES`] operands, callers pack per call.
+//! cap, or past [`MAX_ENTRIES`] operands, callers pack per call, so a budget of 0 turns the
+//! cache off altogether.
 
 use alloc::alloc::{alloc, dealloc, Layout};
 use alloc::rc::Rc;
@@ -62,7 +73,8 @@ fn env_budget_bytes() -> usize {
     0
 }
 
-/// Whether caching is on. Off unless `GEMM_PACKED_LHS_CACHE=1` or [`set_enabled`].
+/// Whether every lhs is cached, not only those under [`with_constant`]. Off unless
+/// `GEMM_PACKED_LHS_CACHE=1` or [`set_enabled`].
 pub fn enabled() -> bool {
     match ENABLED.load(Relaxed) {
         0 => false,
@@ -75,10 +87,104 @@ pub fn enabled() -> bool {
     }
 }
 
-/// Turn caching on or off, overriding the environment. Enabling it asserts this module's
-/// precondition for the whole program, so it belongs to whoever owns `main`.
+/// Turn caching of every lhs on or off, overriding the environment. Enabling it asserts this
+/// module's precondition for the whole program, so it belongs to whoever owns `main`.
+/// Turning it off leaves [`with_constant`] working.
 pub fn set_enabled(on: bool) {
     ENABLED.store(on as u8, Relaxed);
+}
+
+/// A span of memory a caller vouches for: see [`with_constant`]. The default is empty.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Constant {
+    start: usize,
+    end: usize,
+}
+
+impl Constant {
+    /// The `len` elements of `T` starting at `ptr`.
+    pub fn new<T>(ptr: *const T, len: usize) -> Self {
+        let start = ptr as usize;
+        let end = len
+            .checked_mul(core::mem::size_of::<T>())
+            .and_then(|bytes| start.checked_add(bytes));
+        match end {
+            Some(end) => Self { start, end },
+            None => Self::default(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.start >= self.end
+    }
+
+    /// Whether every element of an `m` by `k` matrix at `ptr` with these strides lies inside.
+    fn covers<T>(&self, ptr: *const T, m: usize, k: usize, rs: isize, cs: isize) -> bool {
+        let span = |n: usize, s: isize| isize::try_from(n.checked_sub(1)?).ok()?.checked_mul(s);
+        // The first byte of the lowest element and the end of the highest one.
+        let bounds = || {
+            let (along_m, along_k) = (span(m, rs)?, span(k, cs)?);
+            let size = core::mem::size_of::<T>() as isize;
+            let lo = along_m.min(0).checked_add(along_k.min(0))?;
+            let hi = along_m.max(0).checked_add(along_k.max(0))?.checked_add(1)?;
+            let first = (ptr as usize).checked_add_signed(lo.checked_mul(size)?)?;
+            let end = (ptr as usize).checked_add_signed(hi.checked_mul(size)?)?;
+            Some((first, end))
+        };
+        match bounds() {
+            Some((first, end)) => !self.is_empty() && first >= self.start && end <= self.end,
+            None => false,
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+thread_local! {
+    /// What [`with_constant`] has declared on this thread.
+    static CONSTANT: Cell<Constant> = const { Cell::new(Constant { start: 0, end: 0 }) };
+}
+
+/// Run `f` with `range` declared constant on this thread: a gemm `f` makes on this thread
+/// caches its packed lhs if the lhs lies wholly inside `range`, with or without [`enabled`].
+/// Any other lhs, the activation in a weight-times-activation product included, is packed per
+/// call as usual. The previous declaration is restored when `f` returns or unwinds.
+///
+/// The declaration is per thread, so a caller that splits a gemm across threads passes
+/// [`constant`] to each.
+///
+/// The bytes in `range` must not change while a panel packed from them may still be held,
+/// which is until the thread exits or calls [`clear`]: a model parameter qualifies, a buffer
+/// written in place does not. Bytes freed and later declared again at the same address with
+/// other contents are what the fingerprint tells apart, as with [`enabled`].
+pub fn with_constant<R>(range: Constant, f: impl FnOnce() -> R) -> R {
+    #[cfg(feature = "std")]
+    {
+        struct Restore(Constant);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                CONSTANT.with(|c| c.set(self.0));
+            }
+        }
+        let _restore = Restore(CONSTANT.with(|c| c.replace(range)));
+        f()
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        let _ = range;
+        f()
+    }
+}
+
+/// What [`with_constant`] has declared on this thread, empty outside it.
+pub fn constant() -> Constant {
+    #[cfg(feature = "std")]
+    {
+        CONSTANT.with(|c| c.get())
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        Constant::default()
+    }
 }
 
 /// Ceiling on packed bytes held process-wide.
@@ -233,13 +339,14 @@ unsafe fn fingerprint<T: 'static>(
     h
 }
 
-/// Look up, or reserve, a `bytes`-sized panel for this lhs. `None` -- caching off, first
-/// sighting, or budget spent -- means pack per call as before.
+/// Look up, or reserve, a `bytes`-sized panel for this lhs. `None` means pack per call as
+/// before: for an lhs nobody vouches for, on a first sighting, or with the budget spent.
 ///
 /// # Safety
 ///
-/// `lhs` must be valid for reads of an `m` by `k` matrix with the given strides, and the
-/// bytes behind it must not change for the lifetime of the process.
+/// `lhs` must be valid for reads of an `m` by `k` matrix with the given strides. That its
+/// bytes do not change is the precondition of [`set_enabled`] and [`with_constant`], whichever
+/// let it through.
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn get<T: 'static>(
     lhs: *const T,
@@ -252,7 +359,10 @@ pub unsafe fn get<T: 'static>(
     bytes: usize,
     align: usize,
 ) -> Option<Panel> {
-    if !enabled() || bytes == 0 || m == 0 || k == 0 || lhs.is_null() {
+    if bytes == 0 || m == 0 || k == 0 || lhs.is_null() {
+        return None;
+    }
+    if !enabled() && !constant().covers(lhs, m, k, lhs_rs, lhs_cs) {
         return None;
     }
     let key = Key {
@@ -411,6 +521,42 @@ mod tests {
         assert!(getp(&a).is_none());
         assert!(getp(&a).is_none(), "no panel once the budget is spent");
         assert_eq!(stats().0, 0, "a refusal claims nothing");
+
+        // With the switch off, a declaration admits what lies inside it and nothing else.
+        fresh();
         set_enabled(false);
+        let b = operand(2);
+        let in_a = Constant::new(a.as_ptr(), a.len());
+        with_constant(in_a, || {
+            cycle(&a).mark_filled();
+            assert!(getp(&a).expect("declared").filled);
+            assert!(getp(&b).is_none());
+            assert!(getp(&b).is_none(), "an undeclared lhs is never cached");
+        });
+        assert_eq!(constant(), Constant::default(), "the declaration ends with the closure");
+        assert!(getp(&a).is_none(), "and so does the cache's trust in `a`");
+        clear();
+    }
+
+    #[test]
+    fn constant_covers_only_its_own_bytes() {
+        let a = operand(1);
+        let in_a = Constant::new(a.as_ptr(), a.len());
+        let (m, cs) = (M, M as isize);
+        assert!(in_a.covers(a.as_ptr(), m, M, 1, cs));
+        assert!(in_a.covers(a[M..].as_ptr(), m, M - 1, 1, cs), "a block of columns");
+        assert!(!in_a.covers(a[M..].as_ptr(), m, M, 1, cs), "one column past the end");
+        assert!(in_a.covers(a[M - 1..].as_ptr(), m, M, -1, cs), "rows walked backwards");
+        assert!(!in_a.covers(a[M - 2..].as_ptr(), m, M, -1, cs), "one row before the start");
+        assert!(!Constant::default().covers(a.as_ptr(), m, M, 1, cs));
+
+        let in_b = Constant::new(a[M..].as_ptr(), M);
+        with_constant(in_a, || {
+            with_constant(in_b, || assert_eq!(constant(), in_b));
+            assert_eq!(constant(), in_a, "an inner declaration gives way to the outer one");
+            let unwound = std::panic::catch_unwind(|| with_constant(in_b, || panic!("unwind")));
+            assert!(unwound.is_err());
+            assert_eq!(constant(), in_a, "and does so when it unwinds");
+        });
     }
 }

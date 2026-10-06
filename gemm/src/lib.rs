@@ -76,6 +76,58 @@ mod tests {
         }
         packed_cache::clear();
         packed_cache::set_enabled(false);
+
+        // With the switch off, only what the caller declares is cached. A weight is the rhs of
+        // the row-major product a linear layer issues, `x @ w^T`, and `gemm` transposes that
+        // into a product whose lhs is the weight: the declaration follows it there.
+        let (m, n, k) = (16, 512, 384);
+        let x: Vec<f32> = (0..m * k).map(|_| rand::random()).collect();
+        let w: Vec<f32> = (0..n * k).map(|_| rand::random()).collect();
+        let linear = |dst: &mut [f32]| unsafe {
+            // SAFETY: x is m-by-k and w is n-by-k, both row-major, and dst is m-by-n.
+            gemm::gemm(
+                m, n, k, dst.as_mut_ptr(), 1, n as isize, false, x.as_ptr(), 1, k as isize,
+                w.as_ptr(), k as isize, 1, 0.0, 1.0, false, false, false, Parallelism::None,
+            )
+        };
+        let mut want = vec![0f32; m * n];
+        linear(&mut want);
+        assert_eq!(packed_cache::stats().1, 0, "nothing is cached undeclared");
+        let in_w = packed_cache::Constant::new(w.as_ptr(), w.len());
+        for _ in 0..3 {
+            let mut got = vec![0f32; m * n];
+            packed_cache::with_constant(in_w, || linear(&mut got));
+            assert_eq!(got, want, "a cached panel is a copy: bit for bit the same");
+        }
+        assert_eq!(packed_cache::stats().1, 1, "the declared weight is cached");
+
+        // An operand written in place where the fingerprint does not look, as a key/value cache
+        // is: never cached while undeclared, even next to a declared one, so every call sees
+        // the write. `keys` is the rhs of `q @ keys^T`, so the lhs once transposed.
+        let (t, len, d) = (4, 256, 64);
+        let q: Vec<f32> = (0..t * d).map(|_| rand::random()).collect();
+        let mut keys: Vec<f32> = (0..len * d).map(|_| rand::random()).collect();
+        let scores = |keys: &[f32]| {
+            let mut dst = vec![0f32; t * len];
+            // SAFETY: q is t-by-d and keys is len-by-d, both row-major, and dst is t-by-len.
+            unsafe {
+                gemm::gemm(
+                    t, len, d, dst.as_mut_ptr(), 1, len as isize, false, q.as_ptr(), 1,
+                    d as isize, keys.as_ptr(), d as isize, 1, 0.0, 1.0, false, false, false,
+                    Parallelism::None,
+                )
+            };
+            dst
+        };
+        let in_q = packed_cache::Constant::new(q.as_ptr(), q.len());
+        for step in 0..4 {
+            // Row 1 is never sampled: the fingerprint reads rows `i * len / 8`.
+            keys[d + step] += 1.0;
+            let got = packed_cache::with_constant(in_q, || scores(&keys));
+            assert_eq!(got, scores(&keys.clone()), "step {step} saw the write");
+        }
+        assert_eq!(packed_cache::stats().1, 1, "only the declared weight holds a panel");
+        packed_cache::clear();
     }
 
     #[test]

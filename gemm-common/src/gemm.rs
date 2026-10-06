@@ -431,7 +431,7 @@ pub unsafe fn gemm_basic_generic<
         .saturating_mul(n_k_chunks)
         .saturating_mul(core::mem::size_of::<T>());
     // SAFETY: `lhs` is valid for an m-by-k read with these strides, as the caller of `gemm`
-    // promises; stable contents are the cache's own precondition, which is why it is opt-in.
+    // promises; stable contents are vouched for by whoever opted this lhs into the cache.
     let cached_lhs = unsafe {
         crate::packed_cache::get::<T>(
             lhs.0, m, k, lhs_rs, lhs_cs, kc, MR, lhs_panel_bytes, simd_align,
